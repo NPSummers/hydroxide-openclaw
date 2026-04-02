@@ -1,4 +1,4 @@
-module github.com/emersion/hydroxide
+module github.com/NPSummers/hydroxide-openclaw
 
 go 1.24.0
 
