@@ -62,6 +62,24 @@ hydroxide can be used in multiple modes.
 > Don't start hydroxide multiple times, instead you can use `hydroxide serve`.
 > This requires ports 1025 (smtp), 1143 (imap), and 8080 (carddav).
 
+To run all services in the background:
+
+```shell
+hydroxide serve
+```
+
+To stop the background process:
+
+```shell
+hydroxide stop
+```
+
+On Linux, to register hydroxide to start automatically on login (systemd user service):
+
+```shell
+hydroxide system
+```
+
 ### SMTP
 
 To run hydroxide as an SMTP server:

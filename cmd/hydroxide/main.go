@@ -10,6 +10,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -80,6 +85,163 @@ func askBridgePass(username string) (string, error) {
 
 	b, err := askPass("Bridge password")
 	return string(b), err
+}
+
+func pidFilePath() (string, error) {
+	return config.Path("hydroxide.pid")
+}
+
+func readPID() (int, error) {
+	p, err := pidFilePath()
+	if err != nil {
+		return 0, err
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("invalid pid file: %v", err)
+	}
+	return pid, nil
+}
+
+func writePID(pid int) error {
+	p, err := pidFilePath()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, []byte(strconv.Itoa(pid)), 0600)
+}
+
+func removePIDFile() error {
+	p, err := pidFilePath()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func logFilePath() (string, error) {
+	return config.Path("hydroxide.log")
+}
+
+func startServeInBackground() (int, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return 0, err
+	}
+
+	logPath, err := logFilePath()
+	if err != nil {
+		return 0, err
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return 0, err
+	}
+	defer logFile.Close()
+
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Env = append(os.Environ(), "HYDROXIDE_DAEMON=1")
+	cmd.Stdin = nil
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	if err := cmd.Start(); err != nil {
+		return 0, err
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Process.Release(); err != nil {
+		return 0, err
+	}
+	return pid, nil
+}
+
+func enableStartup() error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("system startup is currently supported on Linux only")
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	configHome, err := os.UserConfigDir()
+	if err != nil {
+		return err
+	}
+	serviceDir := filepath.Join(configHome, "systemd", "user")
+	if err := os.MkdirAll(serviceDir, 0700); err != nil {
+		return err
+	}
+
+	servicePath := filepath.Join(serviceDir, "hydroxide.service")
+	serviceContent := fmt.Sprintf(`[Unit]
+Description=Hydroxide bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HYDROXIDE_DAEMON=1
+ExecStart=%q serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`, exe)
+	if err := os.WriteFile(servicePath, []byte(serviceContent), 0600); err != nil {
+		return err
+	}
+
+	cmd := exec.Command("systemctl", "--user", "daemon-reload")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to reload systemd user units: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	cmd = exec.Command("systemctl", "--user", "enable", "--now", "hydroxide.service")
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to enable startup service: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func runServe(smtpAddr, imapAddr, carddavAddr string, authManager *auth.Manager, eventsManager *events.Manager, tlsConfig *tls.Config, disableSMTP, disableIMAP, disableCardDAV bool) error {
+	done := make(chan error, 3)
+	if !disableSMTP {
+		go func() {
+			done <- listenAndServeSMTP(smtpAddr, debug, authManager, tlsConfig)
+		}()
+	}
+	if !disableIMAP {
+		go func() {
+			done <- listenAndServeIMAP(imapAddr, debug, authManager, eventsManager, tlsConfig)
+		}()
+	}
+	if !disableCardDAV {
+		go func() {
+			done <- listenAndServeCardDAV(carddavAddr, authManager, eventsManager, tlsConfig)
+		}()
+	}
+	return <-done
+}
+
+func runServeManaged(smtpAddr, imapAddr, carddavAddr string, authManager *auth.Manager, eventsManager *events.Manager, tlsConfig *tls.Config, disableSMTP, disableIMAP, disableCardDAV bool) error {
+	if err := writePID(os.Getpid()); err != nil {
+		return fmt.Errorf("failed to write pid file: %v", err)
+	}
+	defer removePIDFile()
+
+	return runServe(smtpAddr, imapAddr, carddavAddr, authManager, eventsManager, tlsConfig, disableSMTP, disableIMAP, disableCardDAV)
 }
 
 func listenAndServeSMTP(addr string, debug bool, authManager *auth.Manager, tlsConfig *tls.Config) error {
@@ -188,9 +350,11 @@ Commands:
 	import-messages <username> [file]	Import messages
 	export-messages [options...] <username>	Export messages
 	sendmail <username> -- <args...>	sendmail(1) interface
-	serve			Run all servers
+	serve			Run all servers in background
 	smtp			Run hydroxide as an SMTP server
 	status			View hydroxide status
+	stop			Stop background hydroxide serve
+	system			Enable start on login
 
 Global options:
 	-debug
@@ -522,23 +686,44 @@ func main() {
 		authManager := auth.NewManager(newClient)
 		eventsManager := events.NewManager()
 
-		done := make(chan error, 3)
-		if !*disableSMTP {
-			go func() {
-				done <- listenAndServeSMTP(smtpAddr, debug, authManager, tlsConfig)
-			}()
+		if os.Getenv("HYDROXIDE_DAEMON") != "1" {
+			pid, err := startServeInBackground()
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Printf("hydroxide serve started in background (pid %d)\n", pid)
+			return
 		}
-		if !*disableIMAP {
-			go func() {
-				done <- listenAndServeIMAP(imapAddr, debug, authManager, eventsManager, tlsConfig)
-			}()
+
+		if err := runServeManaged(smtpAddr, imapAddr, carddavAddr, authManager, eventsManager, tlsConfig, *disableSMTP, *disableIMAP, *disableCardDAV); err != nil {
+			log.Fatal(err)
 		}
-		if !*disableCardDAV {
-			go func() {
-				done <- listenAndServeCardDAV(carddavAddr, authManager, eventsManager, tlsConfig)
-			}()
+	case "stop":
+		pid, err := readPID()
+		if os.IsNotExist(err) {
+			fmt.Println("hydroxide is not running.")
+			return
+		} else if err != nil {
+			log.Fatal(err)
 		}
-		log.Fatal(<-done)
+
+		process, err := os.FindProcess(pid)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := process.Kill(); err != nil {
+			log.Fatal(err)
+		}
+
+		if err := removePIDFile(); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("hydroxide stopped.")
+	case "system":
+		if err := enableStartup(); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("hydroxide startup enabled.")
 	case "sendmail":
 		username := flag.Arg(1)
 		if username == "" || flag.Arg(2) != "--" {
